@@ -1,0 +1,17 @@
+skgre
+skgre-*
+
+*.exe
+*.out
+*.test
+
+/tmp/skgre-wl-*.txt
+
+repo_found_*.txt
+
+vendor/
+
+.idea/
+.vscode/
+*.swp
+*.swo
