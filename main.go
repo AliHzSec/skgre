@@ -23,7 +23,7 @@ import (
 	"github.com/projectdiscovery/gologger/levels"
 )
 
-const version = "1.0.0"
+const version = "1.0.1"
 
 const (
 	ansiGreen  = "\x1b[32m"
@@ -210,13 +210,18 @@ func sanitizeAndSortWordlist(inputPath string) (string, int, error) {
 
 	for scanner.Scan() {
 		word := strings.TrimSpace(scanner.Text())
-		if word == "" || seen[word] {
+		if word == "" {
 			continue
 		}
-		if repoNameRegex.MatchString(word) {
-			seen[word] = true
-			words = append(words, word)
+		if !repoNameRegex.MatchString(word) {
+			continue
 		}
+		normalized := strings.ToLower(word)
+		if seen[normalized] {
+			continue
+		}
+		seen[normalized] = true
+		words = append(words, normalized)
 	}
 	if err := scanner.Err(); err != nil {
 		return "", 0, err
