@@ -23,7 +23,7 @@ import (
 	"github.com/projectdiscovery/gologger/levels"
 )
 
-const version = "1.0.1"
+const version = "1.0.2"
 
 const (
 	ansiGreen  = "\x1b[32m"
@@ -60,6 +60,7 @@ type Options struct {
 	OutputPath    string
 	Debug         bool
 	NoColor       bool
+	PrivateOnly   bool
 }
 
 type Stats struct {
@@ -121,6 +122,7 @@ func printConfig(opts *Options, username string, totalWords int) {
 		fmt.Printf(":: Output           : %s\n", dir)
 	}
 	fmt.Printf(":: Existing Only    : %v\n", opts.ExistingOnly)
+	fmt.Printf(":: Private Only     : %v\n", opts.PrivateOnly)
 	fmt.Println(strings.Repeat("-", 50))
 	fmt.Println()
 }
@@ -337,6 +339,16 @@ func checkRepo(username, repoName, keyPath string, debug bool) (bool, error) {
 	return strings.TrimSpace(outputStr) != "", nil
 }
 
+func isPrivateRepo(username, repoName string) bool {
+	url := fmt.Sprintf("https://api.github.com/repos/%s/%s", username, repoName)
+	resp, err := http.Get(url)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode == http.StatusNotFound
+}
+
 func runInfoMode(opts *Options) error {
 	gologger.Info().Msgf("Checking SSH key: %s", opts.IdentityFile)
 
@@ -549,6 +561,9 @@ func runEnumMode(opts *Options) error {
 					repoURL := fmt.Sprintf("https://github.com/%s/%s", username, candidate)
 
 					if exists {
+						if opts.PrivateOnly && !isPrivateRepo(username, candidate) {
+							continue
+						}
 						stats.addFound()
 						printMu.Lock()
 						foundRepos = append(foundRepos, repoURL)
@@ -652,6 +667,7 @@ func main() {
 	flagSet.CreateGroup("enumeration", "Enumeration",
 		flagSet.IntVarP(&opts.Threads, "threads", "t", 10, "Number of concurrent threads"),
 		flagSet.BoolVarP(&opts.ExistingOnly, "existing-only", "x", false, "Only show existing repositories"),
+		flagSet.BoolVarP(&opts.PrivateOnly, "private-only", "pv", false, "Only show private repositories"),
 	)
 
 	flagSet.CreateGroup("fuzzing", "Fuzzing",
