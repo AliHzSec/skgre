@@ -23,7 +23,7 @@ import (
 	"github.com/projectdiscovery/gologger/levels"
 )
 
-const version = "1.0.2"
+const version = "1.1.0"
 
 const (
 	ansiGreen  = "\x1b[32m"
@@ -46,6 +46,7 @@ var repoNameRegex = regexp.MustCompile(`^[A-Za-z0-9._-]{1,100}$`)
 type Options struct {
 	Mode          string
 	IdentityFile  string
+	Username      string
 	Word          string
 	Wordlist      string
 	Threads       int
@@ -91,7 +92,11 @@ func printConfig(opts *Options, username string, totalWords int) {
 	fmt.Println(strings.Repeat("-", 50))
 	fmt.Printf(":: Mode             : %s\n", opts.Mode)
 	fmt.Printf(":: Identity File    : %s\n", opts.IdentityFile)
-	fmt.Printf(":: GitHub User      : %s\n", username)
+	if opts.Mode == "probe" {
+		fmt.Printf(":: Target User      : %s\n", username)
+	} else {
+		fmt.Printf(":: GitHub User      : %s\n", username)
+	}
 	if opts.Word != "" {
 		fmt.Printf(":: Word             : %s\n", opts.Word)
 	}
@@ -641,6 +646,266 @@ func runEnumMode(opts *Options) error {
 	return nil
 }
 
+func runProbeMode(opts *Options) error {
+	if err := checkKeyPermissions(opts.IdentityFile); err != nil {
+		return err
+	}
+
+	// Step 1: Auth check — warning on failure, not fatal
+	gologger.Info().Msgf("Checking SSH key: %s", opts.IdentityFile)
+	authUser, err := checkSSHKey(opts.IdentityFile)
+	if err != nil {
+		gologger.Warning().Msgf("SSH key not registered on GitHub: %v — continuing with target username", err)
+	} else {
+		gologger.Info().Msgf("Authenticated as: %s - https://github.com/%s", authUser, authUser)
+		orgs, orgErr := getOrganizations(authUser)
+		if orgErr != nil {
+			gologger.Warning().Msgf("Could not fetch organizations: %v", orgErr)
+		} else {
+			for _, org := range orgs {
+				gologger.Info().Msgf("Member of organization: %s - https://github.com/%s", org, org)
+			}
+		}
+	}
+
+	// Use the target username from -u flag for all repo operations
+	username := opts.Username
+
+	// Step 2: Build word list
+	var baseWords []string
+	var tmpFile string
+	var totalBase int
+
+	if opts.Word != "" {
+		word := strings.TrimSpace(opts.Word)
+		if !repoNameRegex.MatchString(word) {
+			return fmt.Errorf("invalid repository name: %s", word)
+		}
+		baseWords = []string{word}
+		totalBase = 1
+	} else {
+		gologger.Info().Msgf("Sanitizing and sorting wordlist...")
+		var count int
+		var wlErr error
+		tmpFile, count, wlErr = sanitizeAndSortWordlist(opts.Wordlist)
+		if wlErr != nil {
+			return wlErr
+		}
+		totalBase = count
+		gologger.Info().Msgf("Wordlist ready: %d valid entries", totalBase)
+
+		cleanup := func() {
+			if tmpFile != "" {
+				os.Remove(tmpFile)
+			}
+		}
+		defer cleanup()
+
+		sigChan := make(chan os.Signal, 1)
+		signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+		go func() {
+			<-sigChan
+			fmt.Print("\r\x1b[2K")
+			gologger.DefaultLogger.SetMaxLevel(levels.LevelInfo)
+			gologger.Warning().Msg("Caught keyboard interrupt (Ctrl-C)")
+			gologger.Info().Msg("Cleaning up temporary files...")
+			cleanup()
+			os.Exit(1)
+		}()
+	}
+
+	// Step 3: Load fuzz words
+	var fuzzWords []string
+	if opts.EnableFuzz {
+		var fuzzErr error
+		fuzzWords, fuzzErr = loadFuzzWords(opts)
+		if fuzzErr != nil {
+			return fuzzErr
+		}
+		gologger.Info().Msgf("Fuzz words loaded: %d entries", len(fuzzWords))
+	}
+
+	// Step 4: Calculate total candidates
+	multiplier := 1
+	if opts.EnableFuzz && len(fuzzWords) > 0 {
+		multiplier = 1 + len(fuzzWords)
+	}
+	totalCandidates := int64(totalBase * multiplier)
+
+	// Step 5: Setup output
+	var outputFile *os.File
+	if opts.OutputEnabled {
+		outDir := opts.OutputPath
+		if outDir == "" {
+			var dirErr error
+			outDir, dirErr = os.Getwd()
+			if dirErr != nil {
+				return fmt.Errorf("cannot determine current directory: %v", dirErr)
+			}
+		}
+		ts := time.Now().Format("20060102_150405")
+		outName := fmt.Sprintf("repo_found_%s_%s.txt", username, ts)
+		outPath := filepath.Join(outDir, outName)
+		var outErr error
+		outputFile, outErr = os.Create(outPath)
+		if outErr != nil {
+			return fmt.Errorf("cannot create output file: %v", outErr)
+		}
+		defer outputFile.Close()
+		gologger.Info().Msgf("Output file: %s", outPath)
+	}
+
+	// Step 6: Print config
+	if !opts.Silent {
+		printConfig(opts, username, int(totalCandidates))
+	}
+
+	// Step 7: Setup stats
+	stats := &Stats{
+		total:     totalCandidates,
+		startTime: time.Now(),
+	}
+
+	// Step 8: Progress printer
+	var printMu sync.Mutex
+
+	drawProgress := func() {
+		checked := atomic.LoadInt64(&stats.checked)
+		found := atomic.LoadInt64(&stats.found)
+		elapsed := time.Since(stats.startTime)
+		fmt.Printf("\r\x1b[2K:: Progress: [%d/%d] :: Found: %d :: Duration: [%s] :: Errors: %d ::",
+			checked, totalCandidates, found,
+			formatDuration(elapsed),
+			atomic.LoadInt64(&stats.errors),
+		)
+	}
+
+	stopProgress := make(chan struct{})
+	var progressWg sync.WaitGroup
+	if !opts.Silent {
+		progressWg.Add(1)
+		go func() {
+			defer progressWg.Done()
+			ticker := time.NewTicker(500 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-stopProgress:
+					return
+				case <-ticker.C:
+					printMu.Lock()
+					drawProgress()
+					printMu.Unlock()
+				}
+			}
+		}()
+	}
+
+	// Step 9: Worker pool
+	type job struct {
+		word string
+	}
+
+	jobs := make(chan job, opts.Threads*2)
+	var wg sync.WaitGroup
+	var foundRepos []string
+
+	for i := 0; i < opts.Threads; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range jobs {
+				candidates := buildCandidates(j.word, fuzzWords, opts)
+				for _, candidate := range candidates {
+					exists, chkErr := checkRepo(username, candidate, opts.IdentityFile, opts.Debug)
+					stats.increment()
+					if chkErr != nil {
+						stats.addError()
+						continue
+					}
+
+					repoURL := fmt.Sprintf("https://github.com/%s/%s", username, candidate)
+
+					if exists {
+						if opts.PrivateOnly && !isPrivateRepo(username, candidate) {
+							continue
+						}
+						stats.addFound()
+						printMu.Lock()
+						foundRepos = append(foundRepos, repoURL)
+						if !opts.NoColor {
+							fmt.Printf("\r\x1b[2K"+ansiGreen+"%s"+ansiReset+"\n", repoURL)
+						} else {
+							fmt.Printf("\r\x1b[2K%s\n", repoURL)
+						}
+						if !opts.Silent {
+							drawProgress()
+						}
+						if outputFile != nil {
+							fmt.Fprintln(outputFile, repoURL)
+						}
+						printMu.Unlock()
+					} else if !opts.ExistingOnly {
+						printMu.Lock()
+						if !opts.NoColor {
+							fmt.Printf("\r\x1b[2K"+ansiYellow+"https://github.com/%s/%s"+ansiReset+"\n", username, candidate)
+						} else {
+							fmt.Printf("\r\x1b[2Khttps://github.com/%s/%s\n", username, candidate)
+						}
+						if !opts.Silent {
+							drawProgress()
+						}
+						printMu.Unlock()
+					}
+				}
+			}
+		}()
+	}
+
+	// Step 10: Feed jobs
+	if opts.Word != "" {
+		for _, w := range baseWords {
+			jobs <- job{word: w}
+		}
+	} else {
+		f, fErr := os.Open(tmpFile)
+		if fErr != nil {
+			close(jobs)
+			return fErr
+		}
+		scanner := bufio.NewScanner(f)
+		buf := make([]byte, 10*1024*1024)
+		scanner.Buffer(buf, len(buf))
+		for scanner.Scan() {
+			word := strings.TrimSpace(scanner.Text())
+			if word != "" {
+				jobs <- job{word: word}
+			}
+		}
+		f.Close()
+	}
+
+	close(jobs)
+	wg.Wait()
+
+	if !opts.Silent {
+		close(stopProgress)
+		progressWg.Wait()
+		elapsed := time.Since(stats.startTime)
+		fmt.Printf("\r\x1b[2K:: Progress: [%d/%d] :: Found: %d :: Duration: [%s] :: Errors: %d ::\n",
+			atomic.LoadInt64(&stats.checked),
+			totalCandidates,
+			atomic.LoadInt64(&stats.found),
+			formatDuration(elapsed),
+			atomic.LoadInt64(&stats.errors),
+		)
+		fmt.Println()
+		fmt.Printf("[*] Scan complete. Found %d repositories.\n", atomic.LoadInt64(&stats.found))
+	}
+
+	return nil
+}
+
 func formatDuration(d time.Duration) string {
 	h := int(d.Hours())
 	m := int(d.Minutes()) % 60
@@ -655,11 +920,12 @@ func main() {
 	flagSet.SetDescription("skgre - SSH Key GitHub Repository Enumerator")
 
 	flagSet.CreateGroup("mode", "Mode",
-		flagSet.StringVarP(&opts.Mode, "mode", "m", "", "Mode: information | enumeration"),
+		flagSet.StringVarP(&opts.Mode, "mode", "m", "", "Mode: information | enumeration | probe"),
 	)
 
 	flagSet.CreateGroup("input", "Input",
 		flagSet.StringVarP(&opts.IdentityFile, "identity-file", "i", "", "Path to SSH private key"),
+		flagSet.StringVarP(&opts.Username, "username", "u", "", "Target GitHub username or organization (probe mode)"),
 		flagSet.StringVarP(&opts.Word, "word", "w", "", "Single repository name to check"),
 		flagSet.StringVarP(&opts.Wordlist, "wordlist", "W", "", "Path to wordlist file"),
 	)
@@ -700,13 +966,13 @@ func main() {
 
 	// Mode is required
 	if opts.Mode == "" {
-		gologger.Error().Msg("Flag -m / -mode is required. Choose one of: information | enumeration")
+		gologger.Error().Msg("Flag -m / -mode is required. Choose one of: information | enumeration | probe")
 		os.Exit(1)
 	}
 
 	opts.Mode = strings.ToLower(strings.TrimSpace(opts.Mode))
-	if opts.Mode != "information" && opts.Mode != "enumeration" {
-		gologger.Fatal().Msgf("Invalid mode '%s'. Choose one of: information | enumeration", opts.Mode)
+	if opts.Mode != "information" && opts.Mode != "enumeration" && opts.Mode != "probe" {
+		gologger.Fatal().Msgf("Invalid mode '%s'. Choose one of: information | enumeration | probe", opts.Mode)
 	}
 
 	// Identity file required for all modes
@@ -724,6 +990,9 @@ func main() {
 	if opts.Mode == "information" {
 		// Validate that no enumeration-specific flags were passed
 		invalidFlags := []string{}
+		if opts.Username != "" {
+			invalidFlags = append(invalidFlags, "-u / -username")
+		}
 		if opts.Word != "" {
 			invalidFlags = append(invalidFlags, "-w / -word")
 		}
@@ -766,7 +1035,57 @@ func main() {
 		return
 	}
 
+	// ──────────────────── Mode: probe ────────────────────
+	if opts.Mode == "probe" {
+		if opts.Username == "" {
+			gologger.Fatal().Msg("Flag -u / -username is required in probe mode")
+		}
+
+		if opts.Word != "" && opts.Wordlist != "" {
+			gologger.Fatal().Msg("Flags -w / -word and -W / -wordlist are mutually exclusive. Use one or the other.")
+		}
+		if opts.Word == "" && opts.Wordlist == "" {
+			gologger.Fatal().Msg("Either -w / -word or -W / -wordlist is required in probe mode")
+		}
+
+		if opts.EnableFuzz {
+			if !opts.FuzzBefore && !opts.FuzzAfter {
+				gologger.Fatal().Msg("When -F / -enable-fuzzing is set, you must specify either -fp / -fuzz-prefix OR -fs / -fuzz-suffix")
+			}
+			if opts.FuzzBefore && opts.FuzzAfter {
+				gologger.Fatal().Msg("Flags -fp / -fuzz-prefix and -fs / -fuzz-suffix are mutually exclusive")
+			}
+			if opts.FuzzWords == "" && opts.FuzzFile == "" {
+				gologger.Fatal().Msg("When fuzzing is enabled, you must provide -fw / -fuzz-words OR -ff / -fuzz-wordlist")
+			}
+			if opts.FuzzWords != "" && opts.FuzzFile != "" {
+				gologger.Fatal().Msg("Flags -fw / -fuzz-words and -ff / -fuzz-wordlist are mutually exclusive")
+			}
+		}
+
+		if opts.FuzzBefore {
+			opts.FuzzAfter = false
+		}
+
+		if opts.Threads <= 0 {
+			opts.Threads = 10
+		}
+
+		if !opts.Silent {
+			gologger.DefaultLogger.SetMaxLevel(levels.LevelInfo)
+		}
+		if err := runProbeMode(opts); err != nil {
+			gologger.Fatal().Msg(err.Error())
+		}
+		return
+	}
+
 	// ──────────────────── Mode: enumeration ────────────────────
+
+	// Reject -u in enumeration mode
+	if opts.Username != "" {
+		gologger.Fatal().Msg("Flag -u / -username is only valid in probe mode")
+	}
 
 	// -w and -W are mutually exclusive
 	if opts.Word != "" && opts.Wordlist != "" {
